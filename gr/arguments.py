@@ -36,3 +36,6 @@ class DataTrainingArguments:
         "help": "se id depth."})
     padding_side: Optional[str] = field(default="right", metadata={"help": "The padding side for training"})
     test_file: Optional[str] = field(default=None,metadata={"help": "A csv or a json file containing the evaluation data.","required":False})
+    response_flag: bool = field(default=True, metadata={"help": "Train on the target semantic ID only."})
+    data_format: str = field(default="auto", metadata={"help": "auto, json, or parquet"})
+    max_train_samples: Optional[int] = field(default=None, metadata={"help": "Optional deterministic smoke limit."})

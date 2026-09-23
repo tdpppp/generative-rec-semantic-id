@@ -2,6 +2,14 @@
 __pycache__/
 *.py[cod]
 *.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
 
 # Model checkpoints & weights
 *.pt
@@ -14,18 +22,22 @@ __pycache__/
 .demo_cache/
 
 # Data files
-gr/gr_train.json
 data/
 *.zip
 *.pkl
 *.jsonl
 *.npy
+*.npz
 
 # Logs
 logs/
 runs/
 *.log
 tf_events/
+checkpoints/
+outputs/
+emb/
+emb_infer/
 
 # Environment
 .env
@@ -37,6 +49,7 @@ env/
 .vscode/
 .idea/
 *.swp
+.ipynb_checkpoints/
 
 # Resume
 ds_resume.md
@@ -51,3 +64,6 @@ question2.txt
 resume_prompt.md 
 SKILL.md
 resume.txt
+INTERVIEW_GUIDE.md
+LEARNING_PLAN.md
+学习笔记和问题记录.md

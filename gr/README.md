@@ -11,7 +11,7 @@
 ├── train_gr.py            # [主程序] 训练入口，负责模型加载、Trainer 初始化
 ├── gr_train.json          # [配置文件] 模型参数、数据参数、训练参数配置
 ├── arguments.py           # [参数定义] 定义 dataclasses (Model/Data/Training Arguments)
-├── custom_dataset.py      # [数据处理] 流式读取 JSON 数据并处理为模型输入
+├── custom_dataset.py      # [数据处理] 流式读取 Parquet/JSON 并构造模型输入
 ├── utils.py               # [工具类] 模型加载 (Qwen2)、Token 字典加载等
 └── requirements.txt       # Python 依赖列表
 ```
@@ -20,7 +20,8 @@
 
 项目主要依赖 **PyTorch**, **Transformers**, **DeepSpeed** 和 **Accelerate**。
 
-运行 `run.sh` 会自动处理依赖安装，主要包含：
+先在仓库根目录执行 `python -m pip install -r requirements.txt` 安装依赖。`run.sh` 只负责
+启动训练，不会在训练任务中修改 Python 或系统环境。主要依赖包含：
 
 - Python 3.8+
 - PyTorch (CUDA 11.7 / 12.x)
@@ -55,24 +56,10 @@
 
 ### 4. 训练数据格式
 
-训练数据为 JSON 格式，支持流式读取。
-
-- **文件名**: `train_data.json` (默认配置)
-
-- **路径**: `$USER_CACHE_PATH/train_data.json`
-
-- **内容结构**:
-
-  JSON
-
-  ```
-  {
-      "user_id_1": ["item_id_A", "item_id_B", "item_id_C"],
-      "user_id_2": ["item_id_X", "item_id_Y"]
-  }
-  ```
-
-  *注意：序列长度小于2的用户将被忽略（至少需要1个历史 + 1个Target）。*
+默认直接流式读取 `data/TencentGR_1M/seq/*.snappy.parquet`。每行包含 `user_id` 和
+由 `item_id/action_type/timestamp` 组成的 `seq`。Semantic ID 映射中的 key 必须使用
+同一套官方 re-indexed item ID。`data_format` 设为 `json` 时仍可读取旧 JSON，但正式
+链路不再依赖它。序列长度小于 2 的用户会被忽略；`max_train_samples` 可限制 smoke 规模。
 
 ## 🚀 运行训练
 
@@ -86,10 +73,9 @@ bash run.sh
 
 ### 运行流程说明：
 
-1. **环境配置**: `run.sh` 会安装 `pip` 和 `conda` 依赖。
-2. **分布式配置**: `run_train.sh` 会设置分布式训练参数。
-   - **注意**: 脚本中强制使用了 `Gloo` 后端并禁用了 `InfiniBand/RDMA` (`NCCL_IB_DISABLE=1`)，强制走 TCP (`DS_TRANSPORT_TCP=1`)。这是为了兼容特定的非 RDMA 网络环境。如果你的环境支持 NVLink/RDMA，请修改 `run_train.sh`。
-3. **启动训练**: 调用 `train_gr.py` 读取 `gr_train.json` 开始训练。
+1. **环境检查**: 从仓库根目录运行 `python environment_check.py`。
+2. **路径解析**: `USER_CACHE_PATH` 提供模型、数据与 Semantic ID 映射的根目录。
+3. **启动训练**: `run_train.sh` 从仓库根目录调用 `python -m gr.train_gr` 并读取 `gr_train.json`。
 
 ## ⚙️ 参数配置 (`gr_train.json`)
 

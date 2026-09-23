@@ -1,15 +1,6 @@
 import numpy as np
 import torch
 import torch.utils.data as data
-import pandas as pd
-import os
-
-import torch
-import pyarrow.parquet as pq
-from torch.utils.data import IterableDataset, DataLoader, DistributedSampler
-import numpy as np
-import pyarrow.orc as orc
-import pyarrow as pa
 
 class CustomNpzFile(data.Dataset):
     def __init__(self, file_list):

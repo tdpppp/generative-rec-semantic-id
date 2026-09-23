@@ -5,9 +5,6 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 
-from dataset import save_emb
-
-
 class FlashMultiHeadAttention(torch.nn.Module):
     def __init__(self, hidden_units, num_heads, dropout_rate):
         super(FlashMultiHeadAttention, self).__init__()
@@ -398,13 +395,14 @@ class BaselineModel(torch.nn.Module):
 
         return final_feat
 
-    def save_item_emb(self, item_ids, retrieval_ids, feat_dict, save_path, batch_size=1024):
+    def save_item_emb(self, item_ids, output_ids, original_ids, feat_dict, save_path, batch_size=1024):
         """
         生成候选库item embedding，用于检索
 
         Args:
             item_ids: 候选item ID（re-id形式）
-            retrieval_ids: 候选item ID（检索ID，从0开始编号，检索脚本使用）
+            output_ids: TencentGR 序列使用的 re-indexed item ID
+            original_ids: TencentGR 原始 item ID，仅作为可追溯元数据
             feat_dict: 训练集所有item特征字典，key为特征ID，value为特征值
             save_path: 保存路径
             batch_size: 批次大小
@@ -426,10 +424,13 @@ class BaselineModel(torch.nn.Module):
             all_embs.append(batch_emb.detach().cpu().numpy().astype(np.float32))
 
         # 合并所有批次的结果并保存
-        final_ids = np.array(retrieval_ids, dtype=np.uint64).reshape(-1, 1)
+        final_ids = np.asarray(output_ids, dtype=np.uint64).reshape(-1)
+        final_original_ids = np.asarray(original_ids, dtype=np.uint64).reshape(-1)
         final_embs = np.concatenate(all_embs, axis=0)
         np.savez(
             Path(save_path, 'embeddings.npz'),
-            ids=final_ids.flatten(),  # 形状 (N,)
-            embs=final_embs          # 形状 (N, D)
+            ids=final_ids,
+            original_ids=final_original_ids,
+            local_ids=np.asarray(item_ids, dtype=np.uint64),
+            embs=final_embs,
         )

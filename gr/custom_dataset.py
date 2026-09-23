@@ -1,117 +1,126 @@
-from torch.utils.data import IterableDataset, Dataset
-import copy
-import torch
-import os
-import pandas as pd
-import random
-import numpy as np
 import json
+import warnings
+from pathlib import Path
+
+import torch.distributed as dist
+from torch.utils.data import IterableDataset, get_worker_info
 
 
 class CustomTrainDataset(IterableDataset):
     def __init__(self, json_path, item2token_dict, tokenizer, data_args):
-        """
-        流式JSON数据加载类，保持与原Parquet处理相同的接口
-        Args:
-            json_path: JSON文件路径（支持本地路径或网络路径）
-            item2token_dict: item到token的映射字典
-            tokenizer: 文本tokenizer
-            data_args: 包含所有数据参数的命名空间对象
-        """
         self.json_path = json_path
         self.tokenizer = tokenizer
         self.token_depth = data_args.token_depth
         self.tokenizer.padding_side = data_args.padding_side
         self.max_seq_length = data_args.max_seq_length
-        self.max_imp_seq_length = data_args.max_imp_seq_length
-        self.max_click_seq_length = data_args.max_click_seq_length
         self.item2token_dict = item2token_dict
         self.response_flag = data_args.response_flag
-        
-        # 计算total_seq_length（保持与原逻辑完全一致）
-        self.total_seq_length = self.max_seq_length * self.token_depth + self.max_imp_seq_length * self.token_depth + self.max_click_seq_length * self.token_depth + self.token_depth + 2 * 1
+        self.data_format = getattr(data_args, "data_format", "auto")
+        self.max_train_samples = getattr(data_args, "max_train_samples", None)
+        self.total_seq_length = self.max_seq_length * self.token_depth + self.token_depth + 2
 
     def _stream_json_data(self):
-        """流式读取JSON文件并生成记录"""
-        with open(self.json_path, 'r') as f:
-            # 先读取整个JSON（大文件建议使用ijson等流式JSON解析器）
-            data = json.load(f)
-            for user_id, item_sequence in data.items():
-                if len(item_sequence) < 2:  # 至少需要1个历史行为和1个目标
-                    continue
-                
-                # 构造与原Parquet格式兼容的字典
-                yield {
-                    'user_id': user_id,
-                    'user_behavior_list': np.array(item_sequence),
-                    'main_imp_item_list': np.array([]),
-                    'main_click_item_list': np.array([]),
-                    'similar_imp_item_list': np.array([]),
-                    'similar_click_item_list': np.array([]),
-                    'guess_imp_item_list': np.array([]),
-                    'guess_click_item_list': np.array([]),
-                    'user_imp_item_list': np.array([]),
-                    'user_click_item_list': np.array([])
-                }
+        try:
+            import ijson
+        except ImportError:
+            warnings.warn(
+                "ijson is not installed; loading the complete training JSON into memory",
+                RuntimeWarning,
+            )
+            with open(self.json_path, "r", encoding="utf-8") as stream:
+                yield from json.load(stream).items()
+            return
 
-    def _process_data_model_log(self, example):
-        """保持与原有完全相同的处理逻辑"""
-        user_behavior_list = np.array(example['user_behavior_list'])
-        
-        target_item = ''
-        if len(user_behavior_list) == 0:
-            return None
-        
-        for i in range(len(user_behavior_list)-1, -1, -1):
-            #因为时效性，所以从后往前看
-            #item2token_dict是key：物品ID，value：token_id的字典
-            item = str(user_behavior_list[i])
-            if item in self.item2token_dict:
-                target_item = item
+        with open(self.json_path, "rb") as stream:
+            yield from ijson.kvitems(stream, "")
+
+    def _stream_parquet_data(self):
+        import pyarrow.parquet as pq
+
+        path = Path(self.json_path)
+        files = [path] if path.is_file() else sorted(path.glob("*.parquet"))
+        if not files:
+            raise FileNotFoundError(f"No Parquet sequence files found at {path}")
+        emitted = 0
+        for file in files:
+            parquet = pq.ParquetFile(file)
+            for batch in parquet.iter_batches(batch_size=2048, columns=["user_id", "seq"]):
+                for row in batch.to_pylist():
+                    sequence = [event["item_id"] for event in (row["seq"] or [])]
+                    if len(sequence) < 2:
+                        continue
+                    yield str(row["user_id"]), sequence
+                    emitted += 1
+                    if self.max_train_samples is not None and emitted >= self.max_train_samples:
+                        return
+
+    def _stream_data(self):
+        path = Path(self.json_path)
+        data_format = self.data_format
+        if data_format == "auto":
+            data_format = "parquet" if path.is_dir() or path.suffix == ".parquet" else "json"
+        if data_format == "parquet":
+            yield from self._stream_parquet_data()
+        elif data_format == "json":
+            for index, record in enumerate(self._stream_json_data()):
+                if self.max_train_samples is not None and index >= self.max_train_samples:
+                    break
+                yield record
+        else:
+            raise ValueError(f"Unsupported training data format: {data_format}")
+
+    def _process_sequence(self, item_sequence):
+        target_index = None
+        target_item = None
+        for index in range(len(item_sequence) - 1, -1, -1):
+            candidate = str(item_sequence[index])
+            if candidate in self.item2token_dict:
+                target_index = index
+                target_item = candidate
                 break
-        
-        if not target_item:
-            #用户完全可能和没有语义 ID 的冷启动/长尾/新物品交互过，
+        if target_index is None:
             return None
-        
-        input_user_behavior_list = []
-        for user_behavior in user_behavior_list:
-            user_behavior_key = str(user_behavior)
-            if user_behavior_key == target_item:
-                continue
-            if user_behavior_key in self.item2token_dict:
-                input_user_behavior_list.append(self.item2token_dict[user_behavior_key])
-        
-        input_user_behavior_list = input_user_behavior_list[-self.max_seq_length:]
-        
-        target_item_seid = self.item2token_dict[target_item]
-        history_behavior_input = '<|hist_clk_start|>' + ''.join(input_user_behavior_list) + '<|hist_clk_end|>'
-        full_inputs = history_behavior_input + target_item_seid
-        target = history_behavior_input
 
+        history_tokens = [
+            self.item2token_dict[str(item)]
+            for item in item_sequence[:target_index]
+            if str(item) in self.item2token_dict
+        ][-self.max_seq_length:]
+        if not history_tokens:
+            return None
+
+        history = "<|hist_clk_start|>" + "".join(history_tokens) + "<|hist_clk_end|>"
+        full_input = history + self.item2token_dict[target_item]
         result = self.tokenizer(
-            text=full_inputs,
-            text_target=target,
-            padding='max_length',
+            full_input,
+            add_special_tokens=False,
+            padding="max_length",
             max_length=self.total_seq_length,
-            truncation=True
+            truncation=True,
         )
-
-        labels = copy.deepcopy(result["input_ids"])
+        history_length = len(self.tokenizer(history, add_special_tokens=False)["input_ids"])
+        labels = list(result["input_ids"])
+        for index in range(min(history_length, len(labels))):
+            labels[index] = -100
         labels = [
-            -100 if labels[i] == self.tokenizer.pad_token_id or result['labels'][i] != self.tokenizer.pad_token_id 
-            else labels[i] 
-            for i in range(len(labels))
+            -100 if token_id == self.tokenizer.pad_token_id else label
+            for token_id, label in zip(result["input_ids"], labels)
         ]
-        result['labels'] = labels
-
+        result["labels"] = labels
         return result
 
     def __iter__(self):
-        """流式迭代器实现"""
-        for example in self._stream_json_data():
-            out_put = self._process_data_model_log(example)
-            if out_put:
-                yield out_put
+        worker = get_worker_info()
+        worker_id = worker.id if worker else 0
+        worker_count = worker.num_workers if worker else 1
+        rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+        world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
+        shard_id = rank * worker_count + worker_id
+        shard_count = world_size * worker_count
 
-
+        for record_index, (_, item_sequence) in enumerate(self._stream_data()):
+            if record_index % shard_count != shard_id or len(item_sequence) < 2:
+                continue
+            output = self._process_sequence(item_sequence)
+            if output is not None:
+                yield output

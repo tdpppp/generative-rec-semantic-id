@@ -1,9 +1,6 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
 
-# show ${RUNTIME_SCRIPT_DIR}
-echo ${RUNTIME_SCRIPT_DIR}
-# enter train workspace
-cd ${RUNTIME_SCRIPT_DIR}
-
-# write your code below
-python -u rqvae_train.py
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "${SCRIPT_DIR}"
+exec python3 -u rqvae_train.py "$@"

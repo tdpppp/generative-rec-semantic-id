@@ -49,7 +49,7 @@ class Trainer(object):
 
 
     def _build_summary_writer(self):
-        writer = SummaryWriter(log_dir='./logs')
+        writer = SummaryWriter(log_dir=self.args.log_dir)
         return writer
 
     def _build_optimizer(self):
@@ -260,6 +260,7 @@ class Trainer(object):
 
 
 
+        self.summary_writer.close()
         return self.best_loss, self.best_collision_rate
 
 

@@ -26,11 +26,11 @@ python - <<'PYEOF'
 import sys
 sys.path.insert(0, '.')
 import model
-import dataset
+import tencentgr_dataset
 from model import BaselineModel
-from dataset import MyDataset
+from tencentgr_dataset import TencentGRDataset
 print("[OK]   model.py   -> BaselineModel（Transformer + Flash Attention）")
-print("[OK]   dataset.py -> MyDataset    （JSONL 用户行为序列加载器）")
+print("[OK]   tencentgr_dataset.py -> TencentGRDataset（Parquet profile 加载器）")
 PYEOF
 
 if [[ -n "${TRAIN_DATA_PATH}" && -d "${TRAIN_DATA_PATH}" ]]; then
@@ -39,7 +39,7 @@ if [[ -n "${TRAIN_DATA_PATH}" && -d "${TRAIN_DATA_PATH}" ]]; then
     export TRAIN_TF_EVENTS_PATH="${DEMO_CACHE}/tf_events"
     export TRAIN_CKPT_PATH="${DEMO_CACHE}/ckpt"
     export USER_CACHE_PATH="${DEMO_CACHE}"
-    python -u main.py --num_epochs 1 --batch_size 16
+    python -u main.py --profile smoke --max_steps 20 --num_epochs 1 --batch_size 16
 else
     echo "[跳过] TRAIN_DATA_PATH 未设置或目录不存在。"
     echo "       执行 export TRAIN_DATA_PATH=/数据路径 后可启用完整训练。"
@@ -71,13 +71,14 @@ print("[OK]   datasets.py    -> CustomNpzFile         （NPZ 向量文件加载�
 print("[OK]   trainer.py     -> Trainer               （含碰撞率监控的训练循环）")
 PYEOF
 
-# 注意：rqvae_train.py 的 __main__ 块中硬编码了 data_path="/emb/emb"（竞赛平台遗留）
-# --data_path 命令行参数会被覆盖，但 epochs/batch_size 仍通过 argparse 正常生效
-RQVAE_DATA="/emb/emb"
+RQVAE_DATA="${DEMO_CACHE}/emb"
 if [[ -d "${RQVAE_DATA}" ]] && ls "${RQVAE_DATA}"/*.npz > /dev/null 2>&1; then
     echo "[信息] 在 ${RQVAE_DATA} 找到 NPZ 向量文件，启动 1 轮 RQ-VAE 训练..."
     export USER_CACHE_PATH="${DEMO_CACHE}"
     python -u rqvae_train.py \
+        --data_path "${RQVAE_DATA}" \
+        --ckpt_dir "${DEMO_CACHE}/rqvae_ckpt" \
+        --log_dir "${DEMO_CACHE}/rqvae_logs" \
         --epochs 1 \
         --batch_size 16 \
         --eval_step 1 \
@@ -114,10 +115,10 @@ print("[OK]   custom_dataset.py -> CustomTrainDataset（IterableDataset，Token 
 PYEOF
 
 GR_MODEL="${USER_CACHE_PATH:-$DEMO_CACHE}/qwen_init2"
-GR_DATA="${USER_CACHE_PATH:-$DEMO_CACHE}/train_data.json"
-GR_TOKENS="${USER_CACHE_PATH:-$DEMO_CACHE}/emb_infer/sinkhorn10"
+GR_DATA="${REPO_ROOT}/data/TencentGR_1M/seq"
+GR_TOKENS="${USER_CACHE_PATH:-$DEMO_CACHE}/emb_infer/sinkhorn"
 
-if [[ -d "${GR_MODEL}" && -f "${GR_DATA}" && -d "${GR_TOKENS}" ]]; then
+if [[ -d "${GR_MODEL}" && -d "${GR_DATA}" && -d "${GR_TOKENS}" ]]; then
     echo "[信息] 检测到 Qwen2 权重、训练数据及商品→Token 映射表。"
     echo "[信息] 使用配置 gr/gr_train.json 启动 GR SFT 微调..."
     export TRAIN_CKPT_PATH="${DEMO_CACHE}/gr_ckpt"
