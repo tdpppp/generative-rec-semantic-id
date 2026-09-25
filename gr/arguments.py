@@ -39,3 +39,8 @@ class DataTrainingArguments:
     response_flag: bool = field(default=True, metadata={"help": "Train on the target semantic ID only."})
     data_format: str = field(default="auto", metadata={"help": "auto, json, or parquet"})
     max_train_samples: Optional[int] = field(default=None, metadata={"help": "Optional deterministic smoke limit."})
+    max_eval_samples: Optional[int] = field(default=None, metadata={"help": "Optional validation/test limit."})
+    profile_split: str = field(
+        default="train",
+        metadata={"help": "Split used when data_format=profile: train, validation, or test."},
+    )

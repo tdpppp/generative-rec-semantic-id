@@ -71,11 +71,70 @@ Bash
 bash run.sh
 ```
 
+### 10k Qwen2.5-0.5B 正式基线
+
+正式基线直接读取 10k profile 缓存。缓存内的 local item ID 会通过 `item_reids.npy`
+还原为官方 re-ID，再与通过质量检查的 Semantic ID mapping 对齐。时间切分规则为：训练集
+使用倒数两个商品之前的滑动前缀，验证集预测倒数第二个商品，测试集预测最后一个商品。
+
+```bash
+export USER_CACHE_PATH="$PWD/outputs"
+export TRAIN_CKPT_PATH="$PWD/outputs/gr/checkpoints"
+python -m gr.train_gr --config gr/gr_train_qwen25_05b_10k_v1.json
+```
+
+当前 10k profile 产生 875,365 个训练样本、10,000 个验证样本和 10,000 个测试样本。
+正式配置使用 Qwen2.5-0.5B Base、BF16、batch size 32，并根据 validation loss 保留最佳
+checkpoint。
+
+训练结束后进行受约束的 Top-10 测试。评估器通过 Semantic ID 前缀树保证输出顺序为
+`a -> b -> c`，并且三层组合必须存在于 mapping：
+
+```bash
+python -m gr.evaluate_gr \
+  --model_path outputs/gr/checkpoints/qwen25_05b_10k_v1 \
+  --profile_path data/TencentGR_1M/cache/profiles/10k-u10000-mm81-82 \
+  --mapping_dir outputs/10k_balanced/emb_infer/sinkhorn \
+  --split test \
+  --batch_size 16 \
+  --top_k 10 \
+  --device cuda:0 \
+  --output outputs/gr/checkpoints/qwen25_05b_10k_v1/test_metrics.json \
+  --predictions outputs/gr/checkpoints/qwen25_05b_10k_v1/test_predictions.jsonl
+```
+
+输出包括 Semantic-ID 级 `HR@10`、`Recall@10`、`NDCG@10`、`MRR@10`、合法格式率、
+合法 mapping 率和目录覆盖率。存在碰撞的 Semantic ID 仍需要单独的 item 级重排策略，不能
+把 Semantic-ID 命中直接表述为无歧义的 item 命中。
+
+### GR 非神经基线评估
+
+使用与模型评估相同的 test split 运行 Random 和 MostPopular Top-10 基线。MostPopular
+只统计每个序列中 validation、test 留出项之前的事件，避免把评估目标泄漏到热门度统计中：
+
+```bash
+python -m gr.evaluate_gr_baselines \
+  --profile_path data/TencentGR_1M/cache/profiles/10k-u10000-mm81-82 \
+  --mapping_dir outputs/10k_balanced/emb_infer/sinkhorn \
+  --split test \
+  --top_k 10 \
+  --seed 2025 \
+  --output_dir outputs/gr/baselines/10k_balanced/semantic_id_top10
+```
+
+结果目录包含两个基线各自的指标 JSON 和逐用户预测 JSONL，以及便于直接比较的
+`comparison.json`。Random 基线固定随机种子；两个基线都只生成 mapping 中存在且互不重复的
+Semantic ID。
+
 ### 运行流程说明：
 
 1. **环境检查**: 从仓库根目录运行 `python environment_check.py`。
 2. **路径解析**: `USER_CACHE_PATH` 提供模型、数据与 Semantic ID 映射的根目录。
 3. **启动训练**: `run_train.sh` 从仓库根目录调用 `python -m gr.train_gr` 并读取 `gr_train.json`。
+
+GR checkpoint 默认写入 `outputs/gr/checkpoints/<output_dir>/`，TensorBoard event 默认写入
+`outputs/gr/tensorboard/<output_dir>/`。可分别通过 `TRAIN_CKPT_PATH` 和
+`TRAIN_TF_EVENTS_PATH` 修改两个根目录。
 
 ## ⚙️ 参数配置 (`gr_train.json`)
 

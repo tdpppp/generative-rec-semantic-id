@@ -6,7 +6,9 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from gr.custom_dataset import CustomTrainDataset
+from gr.custom_dataset import CustomTrainDataset, ProfileSequenceDataset
+from gr.evaluate_gr import SemanticIdConstraint, ranking_metrics, resolve_num_beams
+from gr.train_gr import resolve_training_output_paths
 from gr.utils import load_item2token_dict, semantic_tokens
 
 
@@ -28,7 +30,43 @@ class FakeTokenizer:
         return {"input_ids": input_ids, "attention_mask": [int(token != 0) for token in input_ids]}
 
 
+class FakeConstraintTokenizer:
+    unk_token_id = 0
+
+    def __init__(self):
+        self.ids = {
+            "<a_1>": 1,
+            "<a_2>": 2,
+            "<b_3>": 3,
+            "<b_4>": 4,
+            "<c_5>": 5,
+            "<c_6>": 6,
+        }
+
+    def convert_tokens_to_ids(self, token):
+        return self.ids.get(token, self.unk_token_id)
+
+
 class RepositoryTests(unittest.TestCase):
+    def test_gr_output_and_tensorboard_paths_are_separated(self):
+        output_dir, logging_dir = resolve_training_output_paths(
+            Path("outputs/gr/checkpoints"),
+            Path("outputs/gr/tensorboard"),
+            "qwen25_05b_smoke",
+            "qwen25_05b_smoke/runs/Sep23_host",
+        )
+        self.assertEqual(output_dir, Path("outputs/gr/checkpoints/qwen25_05b_smoke"))
+        self.assertEqual(logging_dir, Path("outputs/gr/tensorboard/qwen25_05b_smoke/runs/Sep23_host"))
+
+        absolute_log = Path("/tmp/gr-events")
+        _, logging_dir = resolve_training_output_paths(
+            Path("outputs/gr/checkpoints"),
+            Path("outputs/gr/tensorboard"),
+            "qwen25_05b_smoke",
+            absolute_log,
+        )
+        self.assertEqual(logging_dir, absolute_log)
+
     def test_gr_config_semantic_depth_matches(self):
         with (ROOT / "gr" / "gr_train.json").open(encoding="utf-8") as stream:
             config = json.load(stream)
@@ -95,6 +133,96 @@ class RepositoryTests(unittest.TestCase):
             dataset = CustomTrainDataset(str(seq_dir), mapping, FakeTokenizer(), args)
             example = next(iter(dataset))
             self.assertEqual(sum(label != -100 for label in example["labels"]), 3)
+
+    def test_gr_profile_temporal_splits_use_official_item_ids_without_leakage(self):
+        import numpy as np
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        args = SimpleNamespace(token_depth=3, padding_side="right", max_seq_length=10)
+        mapping = {
+            str(item_id): f"<a_{item_id}><b_{item_id}><c_{item_id}>"
+            for item_id in (10, 20, 30, 40, 50)
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            profile = Path(temp_dir)
+            np.save(profile / "item_reids.npy", np.array([0, 10, 20, 30, 40, 50]))
+            pq.write_table(
+                pa.Table.from_pylist([{
+                    "reindexed_user_id": 99,
+                    "seq": [
+                        {"item_id": item_id, "action_type": 1, "timestamp": item_id}
+                        for item_id in (1, 2, 3, 4, 5)
+                    ],
+                }]),
+                profile / "sequences.parquet",
+            )
+            train = ProfileSequenceDataset(profile, mapping, FakeTokenizer(), args, split="train")
+            validation = ProfileSequenceDataset(profile, mapping, FakeTokenizer(), args, split="validation")
+            test = ProfileSequenceDataset(profile, mapping, FakeTokenizer(), args, split="test")
+
+            self.assertEqual(len(train), 2)
+            self.assertEqual(train.example_metadata(0)["target_item_id"], 20)
+            self.assertEqual(train.example_metadata(1)["target_item_id"], 30)
+            self.assertEqual(validation.example_metadata(0)["target_item_id"], 40)
+            self.assertEqual(test.example_metadata(0)["target_item_id"], 50)
+            self.assertEqual(test.example_metadata(0)["history_item_ids"], [10, 20, 30, 40])
+            self.assertEqual(sum(label != -100 for label in test[0]["labels"]), 3)
+
+    def test_semantic_id_constraint_only_allows_existing_codes(self):
+        import torch
+
+        constraint = SemanticIdConstraint(
+            FakeConstraintTokenizer(),
+            {"<a_1><b_3><c_5>", "<a_2><b_4><c_6>"},
+            prompt_length=2,
+        )
+        self.assertEqual(constraint.allowed_tokens(0, torch.tensor([9, 9])), [1, 2])
+        self.assertEqual(constraint.allowed_tokens(0, torch.tensor([9, 9, 1])), [3])
+        self.assertEqual(constraint.allowed_tokens(0, torch.tensor([9, 9, 1, 3])), [5])
+        self.assertEqual(constraint.decode([1, 3, 5]), "<a_1><b_3><c_5>")
+        self.assertIsNone(constraint.decode([1, 4, 6]))
+
+    def test_ranking_metrics(self):
+        import math
+
+        metrics = ranking_metrics([1, 2], total=4)
+        self.assertEqual(metrics["hr"], 0.5)
+        self.assertEqual(metrics["recall"], 0.5)
+        self.assertAlmostEqual(metrics["mrr"], 0.375)
+        self.assertAlmostEqual(metrics["ndcg"], (1 + 1 / math.log2(3)) / 4)
+
+    def test_num_beams_defaults_to_top_k_and_rejects_narrow_search(self):
+        self.assertEqual(resolve_num_beams(10), 10)
+        self.assertEqual(resolve_num_beams(10, 20), 20)
+        with self.assertRaisesRegex(ValueError, "greater than or equal to top_k"):
+            resolve_num_beams(10, 9)
+
+    def test_profile_history_limit_keeps_most_recent_items(self):
+        import numpy as np
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        args = SimpleNamespace(token_depth=3, padding_side="right", max_seq_length=2)
+        mapping = {
+            str(item_id): f"<a_{item_id}><b_{item_id}><c_{item_id}>"
+            for item_id in (10, 20, 30, 40, 50)
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            profile = Path(temp_dir)
+            np.save(profile / "item_reids.npy", np.array([0, 10, 20, 30, 40, 50]))
+            pq.write_table(
+                pa.Table.from_pylist([{
+                    "reindexed_user_id": 99,
+                    "seq": [
+                        {"item_id": item_id, "action_type": 1, "timestamp": item_id}
+                        for item_id in (1, 2, 3, 4, 5)
+                    ],
+                }]),
+                profile / "sequences.parquet",
+            )
+            validation = ProfileSequenceDataset(profile, mapping, FakeTokenizer(), args, split="validation")
+            self.assertEqual(validation.example_metadata(0)["history_item_ids"], [20, 30])
 
     def test_tencentgr_profile_uses_compact_ids_and_keeps_reids(self):
         import numpy as np

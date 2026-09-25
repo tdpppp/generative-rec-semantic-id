@@ -1,0 +1,45 @@
+{
+    "model_args": {
+        "from_pretrained": true,
+        "from_checkpoint": false,
+        "pretrained_path": "outputs/models/Qwen2.5-0.5B",
+        "checkpoint_path": "",
+        "tokenizer_path": "outputs/models/Qwen2.5-0.5B",
+        "se_id_space_width": "2048,2048,1024"
+    },
+    "data_args": {
+        "train_file": "../data/TencentGR_1M/seq",
+        "data_format": "parquet",
+        "max_train_samples": 500,
+        "max_seq_length": 100,
+        "max_imp_seq_length": 0,
+        "max_click_seq_length": 0,
+        "token_depth": 3,
+        "padding_side": "right",
+        "item2token_dict": "10k_balanced/emb_infer/sinkhorn",
+        "token2item_dict": "",
+        "response_flag": true
+    },
+    "training_args": {
+        "output_dir": "qwen25_05b_smoke",
+        "max_steps": 20,
+        "num_train_epochs": 1,
+        "per_device_train_batch_size": 2,
+        "save_steps": 20,
+        "logging_steps": 1,
+        "fp16": true,
+        "resume_from_checkpoint": false,
+        "dataloader_pin_memory": false,
+        "per_device_eval_batch_size": 2,
+        "gradient_accumulation_steps": 1,
+        "dataloader_prefetch_factor": 2,
+        "dataloader_num_workers": 2,
+        "learning_rate": 0.0001,
+        "weight_decay": 0.01,
+        "save_strategy": "steps",
+        "save_total_limit": 1,
+        "logging_strategy": "steps",
+        "report_to": "tensorboard",
+        "seed": 2025
+    }
+}

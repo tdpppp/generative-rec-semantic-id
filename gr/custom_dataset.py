@@ -1,9 +1,52 @@
 import json
 import warnings
+from bisect import bisect_right
 from pathlib import Path
 
+import numpy as np
 import torch.distributed as dist
-from torch.utils.data import IterableDataset, get_worker_info
+from torch.utils.data import Dataset, IterableDataset, get_worker_info
+
+
+def encode_semantic_example(
+    item_sequence,
+    target_index,
+    item2token_dict,
+    tokenizer,
+    max_seq_length,
+    token_depth,
+):
+    target_item = str(item_sequence[target_index])
+    target_token = item2token_dict.get(target_item)
+    if target_token is None:
+        return None
+    history_tokens = [
+        item2token_dict[str(item)]
+        for item in item_sequence[:target_index]
+        if str(item) in item2token_dict
+    ][-max_seq_length:]
+    if not history_tokens:
+        return None
+
+    history = "<|hist_clk_start|>" + "".join(history_tokens) + "<|hist_clk_end|>"
+    full_input = history + target_token
+    total_seq_length = max_seq_length * token_depth + token_depth + 2
+    result = tokenizer(
+        full_input,
+        add_special_tokens=False,
+        padding="max_length",
+        max_length=total_seq_length,
+        truncation=True,
+    )
+    history_length = len(tokenizer(history, add_special_tokens=False)["input_ids"])
+    labels = list(result["input_ids"])
+    for index in range(min(history_length, len(labels))):
+        labels[index] = -100
+    result["labels"] = [
+        -100 if token_id == tokenizer.pad_token_id else label
+        for token_id, label in zip(result["input_ids"], labels)
+    ]
+    return result
 
 
 class CustomTrainDataset(IterableDataset):
@@ -80,34 +123,14 @@ class CustomTrainDataset(IterableDataset):
                 break
         if target_index is None:
             return None
-
-        history_tokens = [
-            self.item2token_dict[str(item)]
-            for item in item_sequence[:target_index]
-            if str(item) in self.item2token_dict
-        ][-self.max_seq_length:]
-        if not history_tokens:
-            return None
-
-        history = "<|hist_clk_start|>" + "".join(history_tokens) + "<|hist_clk_end|>"
-        full_input = history + self.item2token_dict[target_item]
-        result = self.tokenizer(
-            full_input,
-            add_special_tokens=False,
-            padding="max_length",
-            max_length=self.total_seq_length,
-            truncation=True,
+        return encode_semantic_example(
+            item_sequence,
+            target_index,
+            self.item2token_dict,
+            self.tokenizer,
+            self.max_seq_length,
+            self.token_depth,
         )
-        history_length = len(self.tokenizer(history, add_special_tokens=False)["input_ids"])
-        labels = list(result["input_ids"])
-        for index in range(min(history_length, len(labels))):
-            labels[index] = -100
-        labels = [
-            -100 if token_id == self.tokenizer.pad_token_id else label
-            for token_id, label in zip(result["input_ids"], labels)
-        ]
-        result["labels"] = labels
-        return result
 
     def __iter__(self):
         worker = get_worker_info()
@@ -124,3 +147,101 @@ class CustomTrainDataset(IterableDataset):
             output = self._process_sequence(item_sequence)
             if output is not None:
                 yield output
+
+
+class ProfileSequenceDataset(Dataset):
+    """Deterministic temporal splits backed by a TencentGR profile cache."""
+
+    SPLITS = {"train", "validation", "test"}
+
+    def __init__(self, profile_path, item2token_dict, tokenizer, data_args, split=None, max_samples=None):
+        import pyarrow.parquet as pq
+
+        self.profile_path = Path(profile_path)
+        self.item2token_dict = item2token_dict
+        self.tokenizer = tokenizer
+        if self.tokenizer is not None:
+            self.tokenizer.padding_side = data_args.padding_side
+        self.max_seq_length = data_args.max_seq_length
+        self.token_depth = data_args.token_depth
+        self.split = split or getattr(data_args, "profile_split", "train")
+        if self.split not in self.SPLITS:
+            raise ValueError(f"Unsupported profile split: {self.split!r}")
+
+        sequence_path = self.profile_path / "sequences.parquet"
+        item_reid_path = self.profile_path / "item_reids.npy"
+        if not sequence_path.is_file() or not item_reid_path.is_file():
+            raise FileNotFoundError(
+                f"Profile cache must contain sequences.parquet and item_reids.npy: {self.profile_path}"
+            )
+        item_reids = np.load(item_reid_path, mmap_mode="r")
+        table = pq.read_table(sequence_path, columns=["reindexed_user_id", "seq"]).combine_chunks()
+
+        self.user_ids = []
+        self.sequences = []
+        sample_counts = []
+        for row in table.to_pylist():
+            official_sequence = []
+            for event in row["seq"] or []:
+                local_id = int(event["item_id"])
+                if local_id <= 0 or local_id >= len(item_reids):
+                    raise ValueError(f"Invalid local item ID {local_id} in {sequence_path}")
+                item_id = int(item_reids[local_id])
+                if str(item_id) in item2token_dict:
+                    official_sequence.append(item_id)
+            count = max(0, len(official_sequence) - 3) if self.split == "train" else int(len(official_sequence) >= 3)
+            if count:
+                self.user_ids.append(int(row["reindexed_user_id"]))
+                self.sequences.append(official_sequence)
+                sample_counts.append(count)
+
+        self.cumulative_counts = np.cumsum(sample_counts, dtype=np.int64)
+        available_samples = int(self.cumulative_counts[-1]) if len(self.cumulative_counts) else 0
+        self.sample_count = available_samples if max_samples is None else min(available_samples, max_samples)
+
+    def __len__(self):
+        return self.sample_count
+
+    def _sample_coordinates(self, index):
+        if index < 0:
+            index += len(self)
+        if index < 0 or index >= len(self):
+            raise IndexError(index)
+        sequence_index = bisect_right(self.cumulative_counts, index)
+        previous_count = 0 if sequence_index == 0 else int(self.cumulative_counts[sequence_index - 1])
+        offset = index - previous_count
+        sequence = self.sequences[sequence_index]
+        if self.split == "train":
+            target_index = 1 + offset
+        elif self.split == "validation":
+            target_index = len(sequence) - 2
+        else:
+            target_index = len(sequence) - 1
+        return sequence_index, target_index
+
+    def example_metadata(self, index):
+        sequence_index, target_index = self._sample_coordinates(index)
+        sequence = self.sequences[sequence_index]
+        target_item = str(sequence[target_index])
+        return {
+            "user_id": self.user_ids[sequence_index],
+            "history_item_ids": sequence[:target_index][-self.max_seq_length:],
+            "target_item_id": int(target_item),
+            "target_semantic_id": self.item2token_dict[target_item],
+        }
+
+    def __getitem__(self, index):
+        if self.tokenizer is None:
+            raise RuntimeError("ProfileSequenceDataset requires a tokenizer to encode model inputs")
+        sequence_index, target_index = self._sample_coordinates(index)
+        result = encode_semantic_example(
+            self.sequences[sequence_index],
+            target_index,
+            self.item2token_dict,
+            self.tokenizer,
+            self.max_seq_length,
+            self.token_depth,
+        )
+        if result is None:
+            raise RuntimeError(f"Profile sample {index} unexpectedly has no valid history or target")
+        return result

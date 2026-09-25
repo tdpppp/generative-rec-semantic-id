@@ -38,6 +38,7 @@ checkpoints/
 outputs/
 emb/
 emb_infer/
+/qwen*/
 
 # Environment
 .env
